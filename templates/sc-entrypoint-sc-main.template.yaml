@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Deploys Sitecore into an existing EKS cluster  (qs-000000)'
+Metadata:
+  QuickStartDocumentation:
+    EntrypointName: "Launch into an existing VPC"
+  AWS::CloudFormation::Interface:
+Parameters:
+  VPCID:
+    Description: ID of the VPC (e.g., vpc-0343606e)
+    Type: AWS::EC2::VPC::Id
+  VPCCIDR:
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.0.0.0/16
+    Description: CIDR Block for the VPC
+    Type: String
+  PrivateSubnet1A:
+    Description: ID of the private subnet 1 in Availability Zone 1 (e.g., subnet-a0246dcd)
+    Type: AWS::EC2::Subnet::Id
+  KeyPair:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair to use for the Sitecore instances.
+  EKSClusterName:
+    Type: String
+    Description: ''
+  EKSClusterRegion:
+    Type: String
+    Description: ''
+  CFGInstanceType:
+    AllowedValues:
+    - m5.large
+    - m5.xlarge
+    - m5.2xlarge
+    - m5.4xlarge
+    - m5.8xlarge
+    - m5a.large
+    - m5a.xlarge
+    - m5a.2xlarge
+    - m5a.4xlarge
+    - r5.large
+    - r5.xlarge
+    - r5.2xlarge
+    - r5.4xlarge
+    - r5.8xlarge
+    - r5a.large
+    - r5a.xlarge
+    - r5a.2xlarge
+    - r5a.4xlarge
+    - r5a.8xlarge
+    - i3.xlarge
+    - i3.2xlarge
+    - i3.4xlarge
+    - i3.8xlarge
+    - c5.large
+    - c5.xlarge
+    - c5.2xlarge
+    - c5.4xlarge
+    - c5.9xlarge
+    ConstraintDescription: Choose an instance type. m3.medium or larger recommended.
+    Default: m5a.xlarge
+    Description: Cluster Config Instance Type.
+    Type: String
+  DeploymentPrefix:
+    Type: String
+    Description: Prefix to be used for the installation. This is limited to 8 characters.
+    MinLength: 1
+    MaxLength: 8
+    AllowedPattern: ^[a-zA-Z0-9]*
+  DeploymentS3Bucket:
+    Type: String
+    Description: S3 Bucket name where the Sitecore 9.3 resources are located (installation files, license file, etc.).
+      This deployment will put objects into this bucket.
+  DeploymentS3KeyPrefix:
+    Type: String
+    Description: "Prefix in the S3 Bucket for the Sitecore install files (eg: resources/)."
+    Default: resources/
+  LambdaZipsBucketName:
+    Description: '[Optional] Name of the S3 bucket where the Lambda zip files should be placed. If you leave this parameter blank, an S3 bucket will be created.'
+    Type: String
+    Default: ''
+  # Quick Start Confguration
+  QSS3BucketName:
+    AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
+    ConstraintDescription:
+      Quick Start bucket name can include numbers, lowercase
+      letters, uppercase letters, and hyphens (-). It cannot start or end with a hyphen
+      (-).
+    Default: aws-quickstart
+    Description:
+      S3 bucket name for the Quick Start assets. Quick Start bucket name
+      can include numbers, lowercase letters, uppercase letters, and hyphens (-).
+      It cannot start or end with a hyphen (-).
+    Type: String
+  QSS3BucketRegion:
+    Default: 'us-east-1'
+    Description: 'The AWS Region where the Quick Start S3 bucket (QSS3BucketName) is hosted. When using your own bucket, you must specify this value.'
+    Type: String
+  QSS3KeyPrefix:
+    AllowedPattern: ^[0-9a-zA-Z-/]*$
+    ConstraintDescription:
+      Quick Start key prefix can include numbers, lowercase letters,
+      uppercase letters, hyphens (-), and forward slash (/).
+    Default: quickstart-sitecore-xp/
+    Description:
+      S3 key prefix for the Quick Start assets. Quick Start key prefix
+      can include numbers, lowercase letters, uppercase letters, hyphens (-), and
+      forward slash (/).
+    Type: String
+Conditions:
+  UsingDefaultBucket: !Equals [!Ref QSS3BucketName, 'aws-quickstart']
+  CreateLambdaZipsBucket: !Equals [!Ref 'LambdaZipsBucketName', '']
+Resources:
+  # Local region S3 bucket for Lambda functions
+  LambdaZipsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLambdaZipsBucket
+  CFGInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Used to configure the EKS deplyment
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref VPCCIDR
+          Description: RDP Traffic from within the VPC
+  # Sitecore Security Stack
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: 
+        !Sub
+          - 'https://${S3Bucket}.s3.${S3Region}.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/sc-security.template.yaml'
+          - S3Region: !If [UsingDefaultBucket, !Ref 'AWS::Region', !Ref QSS3BucketRegion]
+            S3Bucket: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+      Parameters:
+        DeploymentS3Bucket: !Ref DeploymentS3Bucket
+        QSS3BucketName: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+        QSS3KeyPrefix: !Ref QSS3KeyPrefix
+        LambdaZipsBucketName:
+          !If [
+            CreateLambdaZipsBucket,
+            !Ref LambdaZipsBucket,
+            !Ref LambdaZipsBucketName,
+          ]
+  # Create lambda functions
+  FunctionsStack:
+    Type: 'AWS::CloudFormation::Stack'
+    # DependsOn: 
+    #   - SecurityStack
+    Properties:
+      TemplateURL: !Sub
+          - 'https://${S3Bucket}.s3.${S3Region}.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/sitecore-xp-functions.template.yaml'
+          - S3Region: !If [UsingDefaultBucket, !Ref 'AWS::Region', !Ref QSS3BucketRegion]
+            S3Bucket: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+      Parameters:
+        LambdaZipsBucketName:
+          !If [
+            CreateLambdaZipsBucket,
+            !Ref LambdaZipsBucket,
+            !Ref LambdaZipsBucketName,
+          ]
+        QSS3BucketName: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+        QSS3KeyPrefix: !Ref QSS3KeyPrefix
+        CopyZipsRoleArn: !GetAtt SecurityStack.Outputs.CopyZipsRoleArn
+        ConvertCertsRoleArn: !GetAtt SecurityStack.Outputs.ConvertCertificatesLambdaRoleArn
+        DeleteResourcesRoleArn: !GetAtt SecurityStack.Outputs.DeleteResourcesLambdaRoleArn
+        DeploymentPrefix: !Ref DeploymentPrefix
+  # Sitecore Parameter Store Stack
+  ParamStack:
+    Type: AWS::CloudFormation::Stack
+    # DependsOn: 
+    #   - LoadBalancerInternal
+    #   - FunctionsStack
+    Properties:
+      TemplateURL: !Sub
+          - 'https://${S3Bucket}.s3.${S3Region}.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/sc-secrets-parameters.template.yaml'
+          - S3Region: !If [UsingDefaultBucket, !Ref 'AWS::Region', !Ref QSS3BucketRegion]
+            S3Bucket: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+      Parameters:
+        DeploymentPrefix: !Ref DeploymentPrefix
+        DeploymentName: !GetAtt FunctionsStack.Outputs.DeploymentName
+        DeploymentS3Bucket: !Ref DeploymentS3Bucket
+        DeploymentS3KeyPrefix: !Ref DeploymentS3KeyPrefix
+        EKSClusterName: !Ref EKSClusterName
+        EKSClusterRegion: !Ref EKSClusterRegion
+        QSS3KeyPrefix: !Ref QSS3KeyPrefix
+        QSS3BucketName: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+        QSS3BucketRegion: !If [UsingDefaultBucket, !Ref 'AWS::Region', !Ref QSS3BucketRegion]
+  # EKS Config Instance Build Stack
+  CFGInstanceStack:
+    Type: AWS::CloudFormation::Stack
+    # DependsOn: 
+    #   - SecurityStack
+    #   - ParamStack
+    Properties:
+      TemplateURL: 
+        !Sub
+          - 'https://${S3Bucket}.s3.${S3Region}.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/sc-cluster-config-instance.template.yaml'
+          - S3Region: !If [UsingDefaultBucket, !Ref 'AWS::Region', !Ref QSS3BucketRegion]
+            S3Bucket: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+      Parameters:
+        AutomationAssumeRole: !GetAtt SecurityStack.Outputs.SCAutomationRoleARN
+        ImageID: '/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base'
+        KeyPair: !Ref KeyPair
+        PrivateSubnet1A: !Ref PrivateSubnet1A
+        IamInstanceProfile: !GetAtt SecurityStack.Outputs.SCAMIInstanceProfileName
+        SecurityGroupIds: !Ref SitecoreInstanceSG
+        InstanceType: 't2.large'
+        LocalPath: !GetAtt ParamStack.Outputs.SCLocalResourcePath
+        LocalQSScripts: !GetAtt ParamStack.Outputs.QSLocalResourcePath
+        RootStackName: !GetAtt FunctionsStack.Outputs.DeploymentName
+        TargetAmiName: !GetAtt ParamStack.Outputs.CustomAmiName
+        QSS3KeyPrefix: !Ref QSS3KeyPrefix
+        QSS3BucketName: !If [UsingDefaultBucket, !Sub '${QSS3BucketName}-${AWS::Region}', !Ref QSS3BucketName]
+        QSS3BucketRegion: !If [UsingDefaultBucket, !Ref 'AWS::Region', !Ref QSS3BucketRegion]
+Outputs:
+  InternalALBDNS:
+    Description: Internal DNS name of the ALB
+    Value: !GetAtt LoadBalancerInternal.DNSName
+  ExternalALBDNS:
+    Description: DNS name of the external facing ALB. This will be used for the Content Delivery, Content Management & Identity Server DNS CNAME's
+    Value: !GetAtt LoadBalancerExternal.DNSName
+  InternalXConnectDNS:
+    Description: Internal DNS name of the XConnect NLB
+    Value: !GetAtt XConnectNLB.DNSName
+  ContentDelivery:
+    Description: The website name for the Content Delivery role. A CNAME entry needs to be added pointing to the 'ExternalALBDNS'
+    Value: !Ref CDDNSName
+  ContentManagement:
+    Description: The website name for the Content Management role. A CNAME entry needs to be added pointing to the 'ExternalALBDNS'
+    Value: !Ref CMDNSName
+  IdentityServer:
+    Description: The website name for the Identity Server role. A CNAME entry needs to be added pointing to the 'ExternalALBDNS'
+    Value: !Ref ISDNSName
+  SolrURL:
+    Description: The Solr URL configured for the Sitecore deployment
+    Value: !GetAtt ParamStack.Outputs.SolrURL
+  SQLEndpoint:
+    Description: RDS SQL Database endpoint
+    Value: !GetAtt DBStack.Outputs.RDSSQLEndpoint
+  RedisEndpoint:
+    Description: The Redis primary endpoint location for the Content Delivery role
+    Value: !GetAtt DBStack.Outputs.CDRedisEndpoint
+  SitecoreQuickStartPrefix:
+    Description: The prefix used for resources created by the Quick Start
+    Value: !GetAtt FunctionsStack.Outputs.DeploymentName
+  InternalR53Zone:
+    Description: The HostedZone ID of the R53 
+    Value: !If [CreateInternalR53, !GetAtt R53Stack.Outputs.R53IntHostedID, 'Private VPC DNS selected. Please create internal DNS entries for Sitecore. See Deployment Guide for more details.']
+  InternalDNSFQDN:
+    Description: The internal VPC FQDN for the Sitecore deployment 
+    Value: !If [CreateInternalR53, !GetAtt R53Stack.Outputs.InternalDNSFQDN, !Ref IntDNS]
+  LoadBalancerProcRep:
+    Description: The loadbalancer endpoint for the Processing and Reporting DNS CNames.
+    Value: !GetAtt LoadBalancerInternal.DNSName
+  LoadBalancerCollSearch:
+    Description: The loadbalancer endpoint for the CollectionSearch DNS CName.
+    Value: !GetAtt XConnectNLB.DNSName
+  LoadBalancerColl:
+    Description: The loadbalancer endpoint for the Collection DNS CName.
+    Value: !GetAtt CollectionNLB.DNSName
+  LoadBalancerRefData:
+    Description: The loadbalancer endpoint for the ReferenceData DNS CName.
+    Value: !GetAtt RefDataNLB.DNSName
+  LoadBalancerMarketAutoRep:
+    Description: The loadbalancer endpoint for the MarketingAutomationReporting DNS CName.
+    Value: !GetAtt MarketAutoRepNLB.DNSName
+  LoadBalancerMarketAuto:
+    Description: The loadbalancer endpoint for the MarketingAutomation DNS CName.
+    Value: !GetAtt MarketAutoNLB.DNSName
+  LoadBalancerCortexRep:
+    Description: The loadbalancer endpoint for the CortexReporting DNS CName.
+    Value: !GetAtt CortexRepNLB.DNSName
+  LoadBalancerCortexProc:
+    Description: The loadbalancer endpoint for the CortexProcessing DNS CName.
+    Value: !GetAtt CortexProcNLB.DNSName

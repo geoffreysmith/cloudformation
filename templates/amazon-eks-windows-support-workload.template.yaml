@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'deploy a workload to the cluster to prepare the cluster for running Windows workloads (qs-1r15gqig4)'
+Metadata:
+  QSLint:
+    Exclusions: [W9002, W9003, W9004, W9006]
+Parameters:
+  ClusterName:
+    Type: String
+  ClusterKubeServerEndpoint:
+    Type: String
+  ClusterCACert:
+    Type: String
+  OIDCProvider:
+    Type: String
+  DeploymentName:
+    Type: String
+  DeploymentS3BucketName:
+    Type: String
+  DeploymentS3KeyPrefix:
+    Type: String
+  QSS3BucketName:
+    AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
+    Type: String
+  QSS3KeyPrefix:
+    AllowedPattern: ^[0-9a-zA-Z-/.]*$
+    Type: String
+  QSS3BucketRegion:
+    Type: String
+Resources:
+  # This resource creates a Service Account that has no permissions associated with it.
+  # It will be used to authorize our pod to run 'kubectl' commands
+  ServiceAccount:
+    Type: "AWSQS::Kubernetes::Resource"
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: default
+      # Kubernetes manifest
+      Manifest: !Sub 
+      - |
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: internal-kubectl
+          namespace: default
+          annotations:
+            eks.amazonaws.com/role-arn: !GetAtt S3Role.Arn
+      - ResourceName: "ServiceAccountTB"
+        NameSpace: default
+  # Creates role binding to give our service account admin access
+  ServiceClusterRoleBinding:
+    Type: "AWSQS::Kubernetes::Resource"
+    Properties:
+      ClusterName: !Ref ClusterName
+      # Kubernetes manifest
+      Manifest: !!Sub 
+      - |
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          labels:
+            app.kubernetes.io/name: ${ResourceName}
+          name: internal-kubectl-admin
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: cluster-admin
+        subjects:
+        - kind: ServiceAccount
+          name: internal-kubectl
+          namespace: default
+      - ResourceName: !Sub "test-tesat"
+        NameSpace: default
+
+  # Role used by the service account to pull from S3 Bucket
+  S3Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::${AWS::AccountId}:oidc-provider/${OIDCProvider}"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity"
+              }
+            ]
+          }
+        - NameSpace: default
+          ResourceName: internal-kubectl
+      # ManagedPolicyArns:
+      #   - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      Path: '/'
+      Policies:
+        - PolicyName: QSBucketAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${QSS3BucketName}/${QSS3KeyPrefix}*'
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:CancelRotateSecret
+                  - secretsmanager:ListSecretVersionIds
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:GetRandomPassword
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:RestoreSecret
+                  - secretsmanager:RotateSecret
+                  - secretsmanager:UpdateSecretVersionStage
+                  - secretsmanager:ListSecrets
+                Resource: '*'
+  JobResource:
+    Type: 'AWSQS::Kubernetes::Resource'
+    DependsOn: [ServiceClusterRoleBinding]
+    #Version: '1.0'
+    Properties:
+      ClusterName: !Ref ClusterName
+      NameSpace: default
+      # Kubernetes manifest
+      Manifest:
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: windows-prep
+          namespace: default
+        spec:
+          template:
+            spec:
+              serviceAccountName: internal-kubectl
+              containers:
+                - name: windows-prep-container
+                  image: mcr.microsoft.com/windows/servercore:1809
+                  command: ['powershell.exe']
+                  args:
+                    - !Sub >
+                      Read-S3Object -BucketName ${QSS3BucketName} -Region ${QSS3BucketRegion} -KeyPrefix "/${QSS3KeyPrefix}submodules/quickstart-microsoft-utilities/scripts/" -Folder "c:\tb-test-pars\utilities";
+                      Read-S3Object -BucketName ${QSS3BucketName} -Region ${QSS3BucketRegion} -KeyPrefix "/${QSS3KeyPrefix}submodules/quickstart-microsoft-utilities/modules/" -Folder "c:\tb-test-pars\utilities";
+                      Read-S3Object -BucketName ${QSS3BucketName} -Region ${QSS3BucketRegion} -KeyPrefix "/${QSS3KeyPrefix}scripts/install/" -Folder "c:\tb-test-pars\install";
+                      Read-S3Object -BucketName ${DeploymentS3BucketName} -Region ${DeploymentS3BucketName} -KeyPrefix "/${DeploymentS3KeyPrefix}resources/" -Folder "c:\tb-test-pars\";
+                      Read-S3Object -BucketName ${DeploymentS3BucketName} -Region ${DeploymentS3BucketName} -KeyPrefix "/${DeploymentS3KeyPrefix}license/" -Folder "c:\tb-test-pars\";
+                      & "c:\tb-test-pars\utilities\Unzip-Archive.ps1" -Source "c:\tb-test-pars\utilities\AWSQuickStart.zip" -Destination "C:\Windows\system32\WindowsPowerShell\v1.0\Modules\";
+                      & "c:\tb-test-pars\utilities\Unzip-Archive.ps1" -Source "c:\tb-test-pars\$((Get-ChildItem c:\tb-test-pars\*zip).Name)" -Destination "c:\tb-test-pars\";
+                      & c:\tb-test-pars\install\sc-bootstrap-cfg-instance.ps1
+                  env:
+                    - name: K8S_ENDPOINT
+                      value: !Ref ClusterKubeServerEndpoint
+                    - name: K8S_CA_DATA
+                      value: !Ref ClusterCACert
+                    - name: K8S_CLUSTER_NAME
+                      value: !Ref ClusterName
+              restartPolicy: OnFailure
+          backoffLimit: 4

@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'deploy a windows pod to run k8 configuration (qs-123456)'
+Metadata:
+  QSLint:
+    Exclusions: [W9002, W9003, W9004, W9006]
+Parameters:
+  ClusterName:
+    Type: String
+  ClusterKubeServerEndpoint:
+    Type: String
+  ClusterCACert:
+    Type: String
+  OIDCProvider:
+    Type: String
+  DeploymentName:
+    Type: String
+  DeploymentPrefix:
+    Type: String
+  DeploymentS3BucketName:
+    Type: String
+  DeploymentS3KeyPrefix:
+    Type: String
+  DeploymentS3BucketRegion:
+    Type: String
+  QSS3BucketName:
+    AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
+    Type: String
+  QSS3KeyPrefix:
+    AllowedPattern: ^[0-9a-zA-Z-/.]*$
+    Type: String
+  QSS3BucketRegion:
+    Type: String
+Resources:
+  PsuedoRandom:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'DoNotUse'
+  #Role used by the service account to configure the k8 environment
+  ServiceAccountAccessRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'service-account-access-role-${PsuedoRandom.GroupId}'
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::${AWS::AccountId}:oidc-provider/${OIDCProvider}"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity"
+              }
+            ]
+          }
+        - NameSpace: default
+          ResourceName: !Sub sacr-${PsuedoRandom.GroupId}
+          OIDCProvider: !Ref OIDCProvider
+      Path: '/'
+      Policies:
+        - PolicyName: QSBucketAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${QSS3BucketName}/${QSS3KeyPrefix}*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:UpdateSecretVersionStage
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+  # Creates role binding to give our service account admin access
+  ServiceAccountClusterRole:
+    Type: 'AWSQS::Kubernetes::Resource'
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: default
+      Manifest: !Sub
+        - |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            labels:
+              app.kubernetes.io/name: ${ResourceName}
+            name: ${ResourceName}
+          # Modify for your scripts here
+          rules:
+          - apiGroups:
+            - ""
+            resources:
+            - pods
+            - secrets
+            verbs:
+            - get
+            - list
+            - create
+            - update
+            - patch
+        - ResourceName: !Sub 'sacr-${PsuedoRandom.GroupId}'
+
+  ServiceClusterRoleBinding:
+    Type: 'AWSQS::Kubernetes::Resource'
+    Properties:
+      ClusterName: !Ref ClusterName
+      # Kubernetes manifest
+      Manifest: !Sub
+        - |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            labels:
+              app.kubernetes.io/name: ${ResourceName}
+            name: ${ResourceName}
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: ${ResourceName}
+          subjects:
+          - kind: ServiceAccount
+            name: ${ResourceName}
+            namespace: ${NameSpace}
+        - ResourceName: !Sub 'sacr-${PsuedoRandom.GroupId}'
+          NameSpace: default
+  #This resource creates a Service Account that has no permissions associated with it.
+  #It will be used to authorize our pod to run 'kubectl' commands
+  ServiceAccount:
+    Type: 'AWSQS::Kubernetes::Resource'
+    DependsOn: [ServiceAccountClusterRole]
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: default
+      # Kubernetes manifest
+      Manifest: !Sub
+        - |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ${ResourceName}
+            namespace: ${NameSpace}
+            annotations:
+              eks.amazonaws.com/role-arn: arn:aws:iam::${AWS::AccountId}:role/${RoleName}
+        - ResourceName: !Sub 'sacr-${PsuedoRandom.GroupId}'
+          NameSpace: default
+          RoleName: !Sub 'service-account-access-role-${PsuedoRandom.GroupId}'
+  # This Job is used to setup the Windows VPC Webhook and Resource Controller
+  JobResource:
+    Type: 'AWSQS::Kubernetes::Resource'
+    DependsOn: [ServiceClusterRoleBinding]
+    Properties:
+      # The lambda function that executes the manifest against the cluster. This is created in one of the parent stacks
+      # ServiceToken: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:EKS-QuickStart-KubeManifest-${ClusterName}"
+      ClusterName: !Ref ClusterName
+      Namespace: default
+      # Kubernetes manifest
+      Manifest: !Sub
+        - |
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${ResourceName}
+          spec:
+            template:
+              spec:
+                serviceAccountName: ${ResourceName}
+                containers:
+                - name: ${ResourceName}
+                  image: mcr.microsoft.com/windows/servercore:1809
+                  command: ["powershell.exe"]
+                  args: 
+                    - >
+                      Add-Type -AssemblyName System.IO.Compression.FileSystem;Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force;Install-Module AWS.Tools.S3, AWS.Tools.CloudWatchLogs, AWS.Tools.SimpleSystemsManagement, AWS.Tools.SecretsManager -Confirm:$false -Force -Scope AllUsers;Import-Module AWS.Tools.S3, AWS.Tools.CloudwatchLogs, AWS.Tools.SimpleSystemsManagement, AWS.Tools.SecretsManager;Read-S3Object -BucketName ${QSS3BucketName} -Region ${QSS3BucketRegion} -KeyPrefix ('/${QSS3KeyPrefix}submodules/quickstart-microsoft-utilities/modules/AWSQuickStart/') -Folder ${qslocalpath};Read-S3Object -BucketName ${QSS3BucketName} -Region ${QSS3BucketRegion} -KeyPrefix ('/${QSS3KeyPrefix}scripts/install/') -Folder ${qslocalpath};Read-S3Object -BucketName ${DeploymentS3BucketName} -Region ${DeploymentS3BucketRegion} -KeyPrefix ('/${DeploymentS3KeyPrefix}resources/') -Folder ${localpath};Read-S3Object -BucketName ${DeploymentS3BucketName} -Region ${DeploymentS3BucketRegion} -KeyPrefix ('/${DeploymentS3KeyPrefix}license/') -Folder ${localpath};Import-Module '${qslocalpath}\AWSQuickStart.psm1';& ${qslocalpath}\install-product.ps1 -QSS3BucketName ${QSS3BucketName} -QSS3BucketRegion ${QSS3BucketRegion} -QSS3KeyPrefix ${QSS3KeyPrefix} -DeploymentName ${DeploymentName} -DeploymentPrefix ${DeploymentPrefix} -DeploymentS3BucketName ${DeploymentS3BucketName} -DeploymentS3KeyPrefix ${DeploymentS3KeyPrefix} -DeploymentS3BucketRegion ${DeploymentS3BucketRegion};
+                  imagePullPolicy: IfNotPresent
+                nodeSelector:
+                  kubernetes.io/os: windows
+                restartPolicy: Never
+            backoffLimit: 3
+        - ResourceName: !Sub 'sacr-${PsuedoRandom.GroupId}'
+          NameSpace: default
+          ReleaseName: !Sub '${PsuedoRandom.GroupId}'
+          # S3ScriptURL: !Sub 's3://${QSS3BucketName}/${QSS3KeyPrefix}scripts/bootstrap.sh'
+          QSS3BucketName: !Ref QSS3BucketName
+          QSS3BucketRegion: !Ref QSS3BucketRegion
+          QSS3KeyPrefix: !Ref QSS3KeyPrefix
+          DeploymentName: !Ref DeploymentName
+          DeploymentPrefix: !Ref DeploymentPrefix
+          DeploymentS3BucketName: !Ref DeploymentS3BucketName
+          DeploymentS3KeyPrefix: !Ref DeploymentS3KeyPrefix
+          DeploymentS3BucketRegion: !Ref DeploymentS3BucketRegion
+          localpath: !Sub 'c:\${DeploymentPrefix}\resources'
+          qslocalpath: !Sub 'c:\${DeploymentPrefix}\quickstart'
+#  KubeManifestExample:
+#     Type: "AWSQS::Kubernetes::Resource"
+#     Metadata: { cfn-lint: { config: { ignore_checks: [E3002] } } }
+#     Properties:
+#       ClusterName: !Ref KubeClusterName
+#       Namespace: kube-system
+#       # Kubernetes manifest
+#       Manifest:
+#   CDRole:
+#     Type: AWSQS::Kubernetes::Resource
+#     Properties:
+#         ClusterName: !Ref ClusterName
+#         Namespace: default
+#         Url: String

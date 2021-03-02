@@ -1,0 +1,184 @@
+description: Configure EC2 Instance for EKS Cluster access
+schemaVersion: '0.3'
+assumeRole: 'arn:aws:iam::503759272940:role/sc-tb-AutomationServiceRole'
+outputs: null
+parameters:
+  DeploymentRegion:
+    default: us-east-1
+    description: The region the product is being deployed
+    type: String
+  InstanceName:
+    default: AMI-tb-sc-random
+    type: String
+  rootStackName:
+    default: tb-sc-random
+    type: String
+  StackName:
+    default: tCaT-quickstart-slalom-sitecore-sc-InstanceConfig-b7db63a7424740ac93ddc2088c1978b6
+    description: Stack Name Input for cfn resource signal
+    type: String
+  CloudwatchLogGroup:
+    default: tb-sc-random-ssm-amibuild
+    description: The name of the Cloudwatch Log Group
+    type: String
+  MediaS3BucketName:
+    default: tbulding-ci-media
+    type: String
+  MediaS3KeyPrefix:
+    default: sitecore/eks/
+    type: String
+  MediaS3BucketRegion:
+    default: us-east-1
+    type: String
+  MediaLocalResourcesPath:
+    default: 'c:/resourcefiles'
+    type: String
+  QSS3BucketName:
+    default: tcat-0eab2dca75865eb1b038a256aa258635-us-east-1
+    type: String
+  QSS3KeyPrefix:
+    default: quickstart-slalom-sitecore/
+    type: String
+  QSS3BucketRegion:
+    default: us-east-1
+    type: String
+  QSLocalResourcesPath:
+    default: 'c:\quickstart\scripts'
+    type: String
+mainSteps:
+  - name: GetInstance
+    action: 'aws:executeAwsApi'
+    inputs:
+      Filters:
+        - Values:
+            - '{{InstanceName}}'
+          Name: 'tag:Name'
+        - Values:
+            - running
+          Name: instance-state-name
+      Service: ec2
+      Api: DescribeInstances
+    outputs:
+      - Type: String
+        Name: InstanceId
+        Selector: '$.Reservations[0].Instances[0].InstanceId'
+    nextStep: GetS3Objects
+  - name: GetS3Objects
+    action: 'aws:runCommand'
+    onFailure: 'step:signalfailure'
+    maxAttempts: 3
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{GetInstance.InstanceId}}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudwatchLogGroup}}-GetS3Objects'
+      Parameters:
+        commands:
+          - 'Read-S3Object -BucketName {{QSS3BucketName}} -Region {{QSS3BucketRegion}} -KeyPrefix "/{{QSS3KeyPrefix}}submodules/quickstart-microsoft-utilities/scripts/" -Folder "{{QSLocalResourcesPath}}\utilities"'
+          - 'Read-S3Object -BucketName {{QSS3BucketName}} -Region {{QSS3BucketRegion}} -KeyPrefix "/{{QSS3KeyPrefix}}submodules/quickstart-microsoft-utilities/modules/" -Folder "{{QSLocalResourcesPath}}\utilities"'
+          - 'Read-S3Object -BucketName {{QSS3BucketName}} -Region {{QSS3BucketRegion}} -KeyPrefix "/{{QSS3KeyPrefix}}scripts/install/" -Folder "{{QSLocalResourcesPath}}\install"'
+          - 'Read-S3Object -BucketName {{MediaS3BucketName}} -Region {{MediaS3BucketRegion}} -KeyPrefix "/{{MediaS3KeyPrefix}}resources/" -Folder "{{MediaLocalResourcesPath}}\install"'
+          - 'Read-S3Object -BucketName "aws-codedeploy-{{DeploymentRegion}}" -Region {{DeploymentRegion}} -Key latest/codedeploy-agent.msi -File "{{QSLocalResourcesPath}}\codedeploy-agent.msi"'
+          - Main
+    nextStep: DeployLocalResources
+  - name: DeployLocalResources
+    action: 'aws:runCommand'
+    onFailure: 'step:signalfailure'
+    maxAttempts: 3
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{GetInstance.InstanceId}}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudwatchLogGroup}}-DeployLocalResources'
+      Parameters:
+        commands:
+          - '& "{{QSLocalResourcesPath}}\utilities\Unzip-Archive.ps1" -Source "{{QSLocalResourcesPath}}\utilities\AWSQuickStart.zip" -Destination "C:\Windows\system32\WindowsPowerShell\v1.0\Modules\"'
+          - '& "{{QSLocalResourcesPath}}\utilities\Unzip-Archive.ps1" -Source "{{MediaLocalResourcesPath}}\Install\$((Get-ChildItem 'C:\resourcefiles\install\*zip').Name)" -Destination "{{MediaLocalResourcesPath}}\Install\"'
+          - '& {{QSLocalResourcesPath}}\install\sc-bootstrap-cfg-instance.ps1'
+          - '& {{QSLocalResourcesPath}}\codedeploy-agent.msi /quiet /l {{QSLocalResourcesPath}}\codedeploy-agent.log'
+          - Main
+    nextStep: PrepInstance
+  - name: PrepInstance
+    action: 'aws:runCommand'
+    onFailure: 'step:signalfailure'
+    timeoutSeconds: 3600
+    maxAttempts: 3
+    inputs:
+      Parameters:
+        allowDowngrade: 'false'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudwatchLogGroup}}-UpdateSSMAgent'
+      InstanceIds:
+        - '{{GetInstance.InstanceId}}'
+      DocumentName: AWS-UpdateSSMAgent
+    nextStep: UpdateSSMAgent
+  - name: UpdateSSMAgent
+    action: 'aws:runCommand'
+    onFailure: 'step:signalfailure'
+    timeoutSeconds: 600
+    maxAttempts: 3
+    inputs:
+      Parameters:
+        Operation: Install
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudwatchLogGroup}}-installInspectorAgent'
+      InstanceIds:
+        - '{{GetInstance.InstanceId}}'
+      DocumentName: AmazonInspector-ManageAWSAgent
+    nextStep: installInspectorAgent
+  - name: installInspectorAgent
+    action: 'aws:runCommand'
+    timeoutSeconds: 600
+    onFailure: 'step:signalfailure'
+    maxAttempts: 3
+    inputs:
+      Parameters:
+        name: AmazonCloudWatchAgent
+        action: Install
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudwatchLogGroup}}-installUnifiedCloudWatchAgent'
+      InstanceIds:
+        - '{{GetInstance.InstanceId}}'
+      DocumentName: AWS-ConfigureAWSPackage
+    nextStep: installUnifiedCloudWatchAgent
+  - name: installUnifiedCloudWatchAgent
+    action: 'aws:runCommand'
+    timeoutSeconds: 600
+    onFailure: 'step:signalfailure'
+    inputs:
+      DocumentName: AWS-ConfigureAWSPackage
+      InstanceIds:
+        - '{{GetInstance.InstanceId}}'
+      Parameters:
+        name: AmazonCloudWatchAgent
+        action: Install
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudwatchLogGroup}}-installUnifiedCloudWatchAgent'
+    nextStep: signalsuccess
+  - name: signalsuccess
+    action: 'aws:executeAwsApi'
+    isEnd: true
+    inputs:
+      Service: cloudformation
+      Api: SignalResource
+      LogicalResourceId: BuildEC2instance
+      StackName: '{{StackName}}'
+      Status: SUCCESS
+      UniqueId: '{{GetInstance.InstanceId}}'
+  - name: signalfailure
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: cloudformation
+      Api: SignalResource
+      LogicalResourceId: BuildEC2instance
+      StackName: '{{StackName}}'
+      Status: FAILURE
+      UniqueId: '{{GetInstance.InstanceId}}'
